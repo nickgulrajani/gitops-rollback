@@ -114,56 +114,60 @@ jobs:
       # Gate: enforce Argo CD Applications have automated prune/selfHeal + CreateNamespace=true
       # (Parse Application YAML from local_file resources inside the plan; no cluster/API calls)
       - name: Gate — Argo CD Applications must enable automated prune/selfHeal and CreateNamespace
-        run: |
-          set -euo pipefail
+  run: |
+    set -euo pipefail
 
-          mkdir -p _argo_apps
-          # Extract all local_file resources and write only Argo CD Application YAMLs to temp files
-          jq -r '
-            .resource_changes[]?
-            | select(.type=="local_file")
-            | .change.after as $after
-            | [$after.filename, $after.content]
-            | @tsv
-          ' tfplan.json | while IFS=$'\t' read -r FILENAME CONTENT; do
-            if printf '%s\n' "$CONTENT" | grep -q '^kind: *Application' && \
-               printf '%s\n' "$CONTENT" | grep -q '^apiVersion: *argoproj.io/'; then
-              BASENAME="$(basename "$FILENAME")"
-              OUT="_argo_apps/${BASENAME}"
-              printf '%s\n' "$CONTENT" > "$OUT"
-            fi
-          done
+    mkdir -p _argo_apps
 
-          COUNT=$(ls -1 _argo_apps/*.yaml 2>/dev/null | wc -l | tr -d ' ')
-          if [ "${COUNT:-0}" -lt 1 ]; then
-            echo "::error::No Argo CD Applications found in plan (via local_file outputs)."
-            echo "Tip: Ensure terraform/main.tf renders Applications using local_file + yamlencode."
-            exit 1
-          fi
+    # Extract Argo CD Application YAMLs from local_file resources (no cluster calls)
+    while IFS=$'\t' read -r FILENAME CONTENT; do
+      if printf '%s\n' "$CONTENT" | grep -q '^kind: *Application' && \
+         printf '%s\n' "$CONTENT" | grep -q '^apiVersion: *argoproj.io/'; then
+        BASENAME="$(basename "$FILENAME")"
+        OUT="_argo_apps/${BASENAME}"
+        printf '%s\n' "$CONTENT" > "$OUT"
+      fi
+    done < <(
+      jq -r '
+        .resource_changes[]?
+        | select(.type=="local_file")
+        | .change.after as $after
+        | [$after.filename, $after.content]
+        | @tsv
+      ' tfplan.json
+    )
 
-          BAD=""
-          for f in _argo_apps/*.yaml; do
-            j="$(yq -o=json '.' "$f")"
-            name="$(printf '%s' "$j" | jq -r '.metadata.name')"
-            prune="$(printf '%s' "$j" | jq -r '.spec.syncPolicy.automated.prune // false')"
-            selfHeal="$(printf '%s' "$j" | jq -r '.spec.syncPolicy.automated.selfHeal // false')"
-            hasCreateNs="$(printf '%s' "$j" | jq -r '
-              (.spec.syncPolicy.syncOptions // [])
-              | map(tostring)
-              | any(. == "CreateNamespace=true")
-            ')"
-            if [ "$prune" != "true" ] || [ "$selfHeal" != "true" ] || [ "$hasCreateNs" != "true" ]; then
-              opts="$(printf '%s' "$j" | jq -r '(.spec.syncPolicy.syncOptions // []) | join(",")')"
-              BAD="${BAD}\n${name}: prune=${prune} selfHeal=${selfHeal} opts=[${opts}]"
-            fi
-          done
+    COUNT=$(find _argo_apps -maxdepth 1 -type f -name '*.yaml' | wc -l | tr -d ' ')
+    if [ "${COUNT:-0}" -lt 1 ]; then
+      echo "::error::No Argo CD Applications found in plan (via local_file outputs)."
+      echo "Tip: Ensure terraform/main.tf renders Applications using local_file + yamlencode."
+      exit 1
+    fi
 
-          if [ -n "${BAD//\\n/}" ]; then
-            echo "::error::Applications missing required GitOps settings:${BAD}"
-            exit 1
-          fi
+    BAD=""
+    for f in _argo_apps/*.yaml; do
+      [ -e "$f" ] || break
+      j="$(yq -o=json '.' "$f")"
+      name="$(printf '%s' "$j" | jq -r '.metadata.name')"
+      prune="$(printf '%s' "$j" | jq -r '.spec.syncPolicy.automated.prune // false')"
+      selfHeal="$(printf '%s' "$j" | jq -r '.spec.syncPolicy.automated.selfHeal // false')"
+      hasCreateNs="$(printf '%s' "$j" | jq -r '
+        (.spec.syncPolicy.syncOptions // [])
+        | map(tostring)
+        | any(. == "CreateNamespace=true")
+      ')"
+      if [ "$prune" != "true" ] || [ "$selfHeal" != "true" ] || [ "$hasCreateNs" != "true" ]; then
+        opts="$(printf '%s' "$j" | jq -r '(.spec.syncPolicy.syncOptions // []) | join(",")')"
+        BAD="${BAD}\n${name}: prune=${prune} selfHeal=${selfHeal} opts=[${opts}]"
+      fi
+    done
 
-          echo "OK: All Applications have automated {prune,selfHeal} and CreateNamespace=true."
+    if [ -n "${BAD//\\n/}" ]; then
+      echo "::error::Applications missing required GitOps settings:${BAD}"
+      exit 1
+    fi
+
+    echo "OK: All Applications have automated {prune,selfHeal} and CreateNamespace=true."
 
       - name: Plan summary
         run: |
