@@ -2,120 +2,172 @@ name: gitops-argocd-dryrun
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   pull_request:
 
 jobs:
   dryrun:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure jq and yq
+      # Optional sanity: ensure the typical stray scaffold lines aren't lingering
+      - name: Sanity — no stray scaffold artifacts
         run: |
+          set -euo pipefail
+          if grep -R -n -E '^[[:space:]]*"\$@"[[:space:]]*$' .github terraform tfvars || true; then
+            echo "::error::Found stray '\"$@\"' line. Clean files and retry."
+            exit 1
+          fi
+          if grep -R -n -E '^[[:space:]]*"[[:space:]]*$' .github terraform tfvars || true; then
+            echo "::error::Found stray bare '\"' line. Clean files and retry."
+            exit 1
+          fi
+          echo "OK: No stray scaffold artifacts."
+
+      # Create a default tfvars for this scenario if missing
+      - name: Ensure tfvars/gitops.tfvars exists
+        run: |
+          set -euo pipefail
+          mkdir -p tfvars
+          if [ ! -f tfvars/gitops.tfvars ]; then
+            : > tfvars/gitops.tfvars
+            echo 'project      = "gitops-argocd"'        >> tfvars/gitops.tfvars
+            echo 'environment  = "dryrun"'               >> tfvars/gitops.tfvars
+            echo 'name_prefix  = "gitops"'               >> tfvars/gitops.tfvars
+            echo 'repo_url     = "https://github.com/your-org/your-repo.git"' >> tfvars/gitops.tfvars
+            echo 'chart_path   = "helm/app"'             >> tfvars/gitops.tfvars
+            echo 'enable_gitops = true'                  >> tfvars/gitops.tfvars
+            echo "Created tfvars/gitops.tfvars"
+          else
+            echo "tfvars/gitops.tfvars already present"
+          fi
+
+      - name: Install jq & yq
+        run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
+          yq --version
 
-      - name: Set up Terraform
+      - name: Set up Terraform (1.6.6)
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.6.6
 
-      - name: Terraform fmt/validate
+      - name: Terraform fmt & validate
         run: |
           terraform -chdir=terraform init -backend=false
           terraform -chdir=terraform fmt -recursive
           terraform -chdir=terraform validate
 
-      - name: Terraform plan (no apply, no contacts)
-        env:
-          KUBECONFIG: /dev/null
+      - name: Terraform plan (plan-only, zero cost)
         run: |
           set -euo pipefail
           terraform -chdir=terraform init -backend=false
-          terraform -chdir=terraform plan -refresh=false -out=tfplan.binary
+          terraform -chdir=terraform plan -refresh=false \
+            -var-file=../tfvars/gitops.tfvars \
+            -out=tfplan.binary
+          terraform -chdir=terraform show tfplan.binary | sed -n '1,160p'
           terraform -chdir=terraform show -json tfplan.binary > tfplan.json
-          terraform -chdir=terraform show tfplan.binary | sed -n '1,140p'
 
-      # ---- GitOps Gates from tfplan.json (Argo CD Applications) ----
-      - name: Gate — Applications must be ArgoCD kind with automated prune/selfHeal
+      # Gate: enforce Argo CD Applications have automated prune/selfHeal + CreateNamespace=true
+      # (We parse Application YAML from local_file resources inside the plan, no cluster needed)
+      - name: Gate — Argo CD Applications must enable automated prune/selfHeal and CreateNamespace
         run: |
           set -euo pipefail
-          COUNT=$(jq '[.resource_changes[]?
-                       | select(.type=="kubernetes_manifest")
-                       | (.change.after.manifest // .change.after // {})
-                       | select(.kind=="Application" and .apiVersion|test("^argoproj.io/"))
-                      ] | length' tfplan.json)
-          [ "$COUNT" -ge 1 ] || { echo "::error::No Argo CD Applications found in plan"; exit 1; }
 
-          BAD=$(jq -r '
+          mkdir -p _argo_apps
+          # Extract all local_file resources and write only Argo CD Application YAMLs to temp files
+          jq -r '
             .resource_changes[]?
-            | select(.type=="kubernetes_manifest")
-            | (.change.after.manifest // .change.after // {}) as $m
-            | select($m.kind=="Application" and ($m.apiVersion|test("^argoproj.io/")))
-            | . as $app
-            | {name: $app.metadata.name,
-               prune: ($app.spec.syncPolicy.automated.prune // false),
-               selfHeal: ($app.spec.syncPolicy.automated.selfHeal // false),
-               opts: ($app.spec.syncPolicy.syncOptions // [])
-              }
-            | select((.prune!=true) or (.selfHeal!=true) or ( (["CreateNamespace=true"] - .opts) != [] ))
-            | "\(.name): prune=\(.prune) selfHeal=\(.selfHeal) opts=\(.opts|join(","))"
-          ' tfplan.json)
-          if [ -n "$BAD" ]; then
-            echo "::error::Applications missing required GitOps settings:"
-            echo "$BAD"
+            | select(.type=="local_file")
+            | .change.after as $after
+            | [$after.filename, $after.content]
+            | @tsv
+          ' tfplan.json | while IFS=$'\t' read -r FILENAME CONTENT; do
+            if printf '%s\n' "$CONTENT" | grep -q '^kind: *Application' && \
+               printf '%s\n' "$CONTENT" | grep -q '^apiVersion: *argoproj.io/'; then
+              BASENAME="$(basename "$FILENAME")"
+              OUT="_argo_apps/${BASENAME}"
+              printf '%s\n' "$CONTENT" > "$OUT"
+            fi
+          done
+
+          COUNT=$(ls -1 _argo_apps/*.yaml 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${COUNT:-0}" -lt 1 ]; then
+            echo "::error::No Argo CD Applications found in plan (via local_file outputs)."
+            echo "Tip: Ensure terraform/main.tf renders Applications using local_file + yamlencode."
             exit 1
           fi
-          echo "OK: All Applications have automated {prune,selfHeal} and CreateNamespace=true"
 
-      - name: Gate — Destination namespaces defined and distinct
+          BAD=""
+          for f in _argo_apps/*.yaml; do
+            j="$(yq -o=json '.' "$f")"
+            name="$(printf '%s' "$j" | jq -r '.metadata.name')"
+            prune="$(printf '%s' "$j" | jq -r '.spec.syncPolicy.automated.prune // false')"
+            selfHeal="$(printf '%s' "$j" | jq -r '.spec.syncPolicy.automated.selfHeal // false')"
+            hasCreateNs="$(printf '%s' "$j" | jq -r '
+              (.spec.syncPolicy.syncOptions // [])
+              | map(tostring)
+              | any(. == "CreateNamespace=true")
+            ')"
+            if [ "$prune" != "true" ] || [ "$selfHeal" != "true" ] || [ "$hasCreateNs" != "true" ]; then
+              opts="$(printf '%s' "$j" | jq -r '(.spec.syncPolicy.syncOptions // []) | join(",")')"
+              BAD="${BAD}\n${name}: prune=${prune} selfHeal=${selfHeal} opts=[${opts}]"
+            fi
+          done
+
+          if [ -n "${BAD//\\n/}" ]; then
+            echo "::error::Applications missing required GitOps settings:${BAD}"
+            exit 1
+          fi
+
+          echo "OK: All Applications have automated {prune,selfHeal} and CreateNamespace=true."
+
+      - name: Plan summary
         run: |
           set -euo pipefail
-          NS=$(jq -r '
-            [.resource_changes[]?
-              | select(.type=="kubernetes_manifest")
-              | (.change.after.manifest // .change.after // {})
-              | select(.kind=="Application" and (.apiVersion|test("^argoproj.io/")))
-              | .spec.destination.namespace] | unique | .[]' tfplan.json)
-          if [ -z "$NS" ]; then
-            echo "::error::No destination namespaces found in Applications"
-            exit 1
-          fi
-          echo "Namespaces in plan:"; echo "$NS" | sed 's/^/- /'
-          echo "OK: destination namespaces present"
-
-      - name: Generate rollback runbook (doc only)
-        run: |
-          cat > rollback-runbook.md <<'MD'
-          # GitOps Automated Rollback (Runbook)
-          ## Using Argo CD CLI (illustrative)
-          # Roll back to the previous healthy revision:
-          argocd app history ms-staging
-          argocd app rollback ms-staging <REVISION>
-          argocd app history ms-prod
-          argocd app rollback ms-prod <REVISION>
-
-          ## Or sync to a tagged git revision:
-          argocd app set ms-staging --revision <GIT_TAG_OR_SHA>
-          argocd app sync ms-staging
-          argocd app set ms-prod --revision <GIT_TAG_OR_SHA>
-          argocd app sync ms-prod
-          MD
-          sed -n '1,60p' rollback-runbook.md
+          ADDS=$(jq '[.resource_changes[]? | select(.change.actions|index("create"))] | length' tfplan.json)
+          TYPES=$(jq -r '
+            [.resource_changes[]? | select(.change.actions|index("create")) | .type]
+            | group_by(.) | map({type: .[0], count: length})
+            | sort_by(-.count)
+            | (["Type","Creates"] as $H | $H), (.[] | [.type, (.count|tostring)])
+            | @tsv' tfplan.json | column -t)
+          {
+            echo "# GitOps ArgoCD Dry-Run Plan Summary"
+            echo
+            echo "**Adds:** ${ADDS}"
+            echo
+            echo "## Created Resource Types"
+            echo '```text'
+            echo "$TYPES"
+            echo '```'
+          } > plan-summary.md
+          sed -n '1,120p' plan-summary.md
+          {
+            echo "### GitOps Dry-Run Summary"
+            echo
+            echo "- Adds: ${ADDS}"
+            echo "- Gate: ArgoCD Applications have prune/selfHeal + CreateNamespace=true"
+            echo
+            echo "_Artifacts: tfplan.binary, tfplan.json, plan-summary.md, _argo_apps/*_"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: gitops-argocd-dryrun-artifacts
           path: |
-            terraform/tfplan.binary
             tfplan.json
-            k8s/argocd
-            rollback-runbook.md
-          if-no-files-found: warn
-
+            terraform/tfplan.binary
+            plan-summary.md
+            _argo_apps
+          if-no-files-found: error
