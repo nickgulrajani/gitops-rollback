@@ -1,0 +1,121 @@
+name: gitops-argocd-dryrun
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  dryrun:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure jq and yq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform fmt/validate
+        run: |
+          terraform -chdir=terraform init -backend=false
+          terraform -chdir=terraform fmt -recursive
+          terraform -chdir=terraform validate
+
+      - name: Terraform plan (no apply, no contacts)
+        env:
+          KUBECONFIG: /dev/null
+        run: |
+          set -euo pipefail
+          terraform -chdir=terraform init -backend=false
+          terraform -chdir=terraform plan -refresh=false -out=tfplan.binary
+          terraform -chdir=terraform show -json tfplan.binary > tfplan.json
+          terraform -chdir=terraform show tfplan.binary | sed -n '1,140p'
+
+      # ---- GitOps Gates from tfplan.json (Argo CD Applications) ----
+      - name: Gate — Applications must be ArgoCD kind with automated prune/selfHeal
+        run: |
+          set -euo pipefail
+          COUNT=$(jq '[.resource_changes[]?
+                       | select(.type=="kubernetes_manifest")
+                       | (.change.after.manifest // .change.after // {})
+                       | select(.kind=="Application" and .apiVersion|test("^argoproj.io/"))
+                      ] | length' tfplan.json)
+          [ "$COUNT" -ge 1 ] || { echo "::error::No Argo CD Applications found in plan"; exit 1; }
+
+          BAD=$(jq -r '
+            .resource_changes[]?
+            | select(.type=="kubernetes_manifest")
+            | (.change.after.manifest // .change.after // {}) as $m
+            | select($m.kind=="Application" and ($m.apiVersion|test("^argoproj.io/")))
+            | . as $app
+            | {name: $app.metadata.name,
+               prune: ($app.spec.syncPolicy.automated.prune // false),
+               selfHeal: ($app.spec.syncPolicy.automated.selfHeal // false),
+               opts: ($app.spec.syncPolicy.syncOptions // [])
+              }
+            | select((.prune!=true) or (.selfHeal!=true) or ( (["CreateNamespace=true"] - .opts) != [] ))
+            | "\(.name): prune=\(.prune) selfHeal=\(.selfHeal) opts=\(.opts|join(","))"
+          ' tfplan.json)
+          if [ -n "$BAD" ]; then
+            echo "::error::Applications missing required GitOps settings:"
+            echo "$BAD"
+            exit 1
+          fi
+          echo "OK: All Applications have automated {prune,selfHeal} and CreateNamespace=true"
+
+      - name: Gate — Destination namespaces defined and distinct
+        run: |
+          set -euo pipefail
+          NS=$(jq -r '
+            [.resource_changes[]?
+              | select(.type=="kubernetes_manifest")
+              | (.change.after.manifest // .change.after // {})
+              | select(.kind=="Application" and (.apiVersion|test("^argoproj.io/")))
+              | .spec.destination.namespace] | unique | .[]' tfplan.json)
+          if [ -z "$NS" ]; then
+            echo "::error::No destination namespaces found in Applications"
+            exit 1
+          fi
+          echo "Namespaces in plan:"; echo "$NS" | sed 's/^/- /'
+          echo "OK: destination namespaces present"
+
+      - name: Generate rollback runbook (doc only)
+        run: |
+          cat > rollback-runbook.md <<'MD'
+          # GitOps Automated Rollback (Runbook)
+          ## Using Argo CD CLI (illustrative)
+          # Roll back to the previous healthy revision:
+          argocd app history ms-staging
+          argocd app rollback ms-staging <REVISION>
+          argocd app history ms-prod
+          argocd app rollback ms-prod <REVISION>
+
+          ## Or sync to a tagged git revision:
+          argocd app set ms-staging --revision <GIT_TAG_OR_SHA>
+          argocd app sync ms-staging
+          argocd app set ms-prod --revision <GIT_TAG_OR_SHA>
+          argocd app sync ms-prod
+          MD
+          sed -n '1,60p' rollback-runbook.md
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitops-argocd-dryrun-artifacts
+          path: |
+            terraform/tfplan.binary
+            tfplan.json
+            k8s/argocd
+            rollback-runbook.md
+          if-no-files-found: warn
+
