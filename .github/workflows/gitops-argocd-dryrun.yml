@@ -15,18 +15,52 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Optional sanity: ensure the typical stray scaffold lines aren't lingering
+      # Pinpoint & show any bad scaffold artifacts (like a bare " line)
       - name: Sanity — no stray scaffold artifacts
         run: |
           set -euo pipefail
-          if grep -R -n -E '^[[:space:]]*"\$@"[[:space:]]*$' .github terraform tfvars || true; then
-            echo "::error::Found stray '\"$@\"' line. Clean files and retry."
+          echo "Scanning for stray scaffold artifacts…"
+
+          FAIL=0
+
+          echo ">> Checking for literal \"\$@\" lines"
+          if HITS=$(grep -R -n -E '^[[:space:]]*"\$@"[[:space:]]*$' \
+            --binary-files=without-match \
+            --exclude-dir=.git --exclude-dir=_argo_apps \
+            --include='*.tf' --include='*.tfvars' --include='*.yml' --include='*.yaml' \
+            . || true); then
+            if [ -n "$HITS" ]; then
+              echo "::error::Found stray '\"$@\"' line(s):"
+              echo "$HITS"
+              FAIL=1
+            fi
+          fi
+
+          echo ">> Checking for bare double-quote lines"
+          if HITS=$(grep -R -n -E '^[[:space:]]*"[[:space:]]*$' \
+            --binary-files=without-match \
+            --exclude-dir=.git --exclude-dir=_argo_apps \
+            --exclude='*.tar' --exclude='*.bin' --exclude='*.binary' \
+            --include='*.tf' --include='*.tfvars' --include='*.yml' --include='*.yaml' \
+            . || true); then
+            if [ -n "$HITS" ]; then
+              echo "::group::Bare double-quote offenders (with context)"
+              echo "$HITS"
+              # show 3 lines of context for each hit
+              echo "$HITS" | cut -d: -f1-2 | while IFS=: read -r f l; do
+                echo "---- $f:$l ----"
+                nl -ba "$f" | sed -n "$((l-3)),$((l+3))p" || true
+              done
+              echo "::endgroup::"
+              FAIL=1
+            fi
+          fi
+
+          if [ "$FAIL" -eq 1 ]; then
+            echo "::error::Please remove the lines above and re-run."
             exit 1
           fi
-          if grep -R -n -E '^[[:space:]]*"[[:space:]]*$' .github terraform tfvars || true; then
-            echo "::error::Found stray bare '\"' line. Clean files and retry."
-            exit 1
-          fi
+
           echo "OK: No stray scaffold artifacts."
 
       # Create a default tfvars for this scenario if missing
@@ -36,12 +70,12 @@ jobs:
           mkdir -p tfvars
           if [ ! -f tfvars/gitops.tfvars ]; then
             : > tfvars/gitops.tfvars
-            echo 'project      = "gitops-argocd"'        >> tfvars/gitops.tfvars
-            echo 'environment  = "dryrun"'               >> tfvars/gitops.tfvars
-            echo 'name_prefix  = "gitops"'               >> tfvars/gitops.tfvars
-            echo 'repo_url     = "https://github.com/your-org/your-repo.git"' >> tfvars/gitops.tfvars
-            echo 'chart_path   = "helm/app"'             >> tfvars/gitops.tfvars
-            echo 'enable_gitops = true'                  >> tfvars/gitops.tfvars
+            echo 'project       = "gitops-argocd"'        >> tfvars/gitops.tfvars
+            echo 'environment   = "dryrun"'               >> tfvars/gitops.tfvars
+            echo 'name_prefix   = "gitops"'               >> tfvars/gitops.tfvars
+            echo 'repo_url      = "https://github.com/your-org/your-repo.git"' >> tfvars/gitops.tfvars
+            echo 'chart_path    = "helm/app"'             >> tfvars/gitops.tfvars
+            echo 'enable_gitops = true'                   >> tfvars/gitops.tfvars
             echo "Created tfvars/gitops.tfvars"
           else
             echo "tfvars/gitops.tfvars already present"
@@ -78,7 +112,7 @@ jobs:
           terraform -chdir=terraform show -json tfplan.binary > tfplan.json
 
       # Gate: enforce Argo CD Applications have automated prune/selfHeal + CreateNamespace=true
-      # (We parse Application YAML from local_file resources inside the plan, no cluster needed)
+      # (Parse Application YAML from local_file resources inside the plan; no cluster/API calls)
       - name: Gate — Argo CD Applications must enable automated prune/selfHeal and CreateNamespace
         run: |
           set -euo pipefail
