@@ -18,17 +18,17 @@ variable "name_prefix" {
 
 variable "repo_url" {
   type        = string
-  description = "Git repo URL tracked by Argo CD"
+  description = "Git repository URL that Argo CD will sync from"
   default     = "https://github.com/nickgulrajani/gitops-rollback"
 }
 
 variable "chart_path" {
   type        = string
-  description = "Path inside repo to the Helm chart or manifests"
+  description = "Path in repo where the Helm chart or kustomize lives"
   default     = "helm/app"
 }
 
-# Optional: declare to silence your tfvars warning (even if unused)
+# Optional: declared just to silence tfvars warnings (not used at runtime)
 variable "enable_gitops" {
   type        = bool
   description = "Toggle (declared to avoid warnings); not used in dry run"
